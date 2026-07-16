@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prism-orchestrator"
+version = "0.1.0"
+description = "Probabilistic Routing with Intelligent Speculative Multi-agent Orchestration"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "Abhishek Mittal" }]
+keywords = [
+    "ai-orchestration",
+    "multi-agent",
+    "speculative-execution",
+    "bandit",
+    "thompson-sampling",
+    "llm",
+    "uncertainty",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# PRISM's core intentionally depends on nothing but the standard library so it
+# runs anywhere with zero friction. Everything below (plotting, real LLM
+# backends) is strictly optional and only used by examples / adapters.
+dependencies = []
+
+[project.optional-dependencies]
+viz = ["matplotlib>=3.5"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+prism = "prism.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/aabhimittal/prism-probabilistic-routing-with-intelligent-speculative-multi-agent-orchestration"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
