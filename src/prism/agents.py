@@ -54,6 +54,14 @@ class SimulatedAgent:
         Relative compute cost of one invocation (drives the speculation budget).
     base_latency : float
         Simulated seconds per call (never actually slept unless you ask).
+    simulate_latency : bool
+        When True the agent really ``time.sleep``s its drawn latency, so
+        latency-sensitive machinery (timeouts, hedging) can be exercised for
+        real in tests and demos.
+    tail : (probability, seconds) or None
+        Heavy-tail injection: with the given probability a call takes
+        ``seconds`` instead of ``base_latency`` — modelling the p99 disasters
+        that latency hedging exists to absorb.
     """
 
     def __init__(
@@ -63,12 +71,16 @@ class SimulatedAgent:
         default_competence: tuple[float, float] = (0.5, 0.18),
         cost: float = 1.0,
         base_latency: float = 0.02,
+        simulate_latency: bool = False,
+        tail: Optional[tuple[float, float]] = None,
     ) -> None:
         self.name = name
         self.competence = competence or {}
         self.default_competence = default_competence
         self.cost = cost
         self.base_latency = base_latency
+        self.simulate_latency = simulate_latency
+        self.tail = tail
         # Per-agent RNG stream so runs are reproducible *and* agents don't
         # correlate with each other through a shared global seed.
         self._rng = random.Random(hash(name) & 0xFFFFFFFF)
@@ -88,6 +100,12 @@ class SimulatedAgent:
 
     def run(self, task: Task) -> AgentOutput:
         quality = self._draw_quality(task.task_type)
+        latency = self.base_latency * (0.8 + 0.4 * self._rng.random())
+        if self.tail is not None and self._rng.random() < self.tail[0]:
+            latency = self.tail[1]
+        if self.simulate_latency:
+            import time
+            time.sleep(latency)
         # A synthetic "answer" whose text encodes provenance so multi-stage
         # demos read sensibly. Real agents return real content here.
         text = f"[{self.name}:{task.task_type} q={quality:.2f}] {task.payload}"
@@ -96,7 +114,7 @@ class SimulatedAgent:
             self_report=_clamp(quality + self._rng.gauss(0, 0.05), 0, 1),
             latent_quality=quality,
             cost=self.cost,
-            latency=self.base_latency * (0.8 + 0.4 * self._rng.random()),
+            latency=latency,
         )
 
 
@@ -178,3 +196,46 @@ class CallableAgent:
             return result
         return AgentOutput(output=result, self_report=self._self_report,
                            latent_quality=None, cost=self.cost)
+
+
+class FlakyAgent:
+    """Chaos-engineering wrapper: makes any agent fail on demand.
+
+    Wraps an inner agent and injects failures — either randomly at
+    ``failure_rate``, or deterministically during an outage window
+    ``fail_between=(start, end)`` (end exclusive). The window is measured
+    against this agent's own call count by default; pass ``clock`` (any
+    ``() -> int``, e.g. the orchestrator's run counter) to key the outage to
+    external time instead — real outages are wall-clock phenomena, and a
+    call-count window can never end while a circuit breaker is holding the
+    agent out of rotation. Used by the resilience tests and demos to exercise
+    branch failure, failover, and the circuit breaker without mocking internals.
+    """
+
+    def __init__(
+        self,
+        inner: Agent,
+        failure_rate: float = 0.0,
+        fail_between: Optional[tuple[int, int]] = None,
+        exception: type = RuntimeError,
+        seed: int = 0,
+        clock: Optional[Callable[[], int]] = None,
+    ) -> None:
+        self.inner = inner
+        self.name = inner.name
+        self.cost = inner.cost
+        self.failure_rate = failure_rate
+        self.fail_between = fail_between
+        self.exception = exception
+        self.calls = 0
+        self.clock = clock
+        self._rng = random.Random(seed)
+
+    def run(self, task: Task) -> AgentOutput:
+        idx = self.clock() if self.clock is not None else self.calls
+        self.calls += 1
+        in_window = (self.fail_between is not None
+                     and self.fail_between[0] <= idx < self.fail_between[1])
+        if in_window or self._rng.random() < self.failure_rate:
+            raise self.exception(f"{self.name} simulated failure (call {idx})")
+        return self.inner.run(task)

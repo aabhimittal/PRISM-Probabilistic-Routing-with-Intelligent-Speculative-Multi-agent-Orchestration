@@ -59,6 +59,21 @@ stops once it knows what works:
 | 4 | **Compound uncertainty** | Per-stage confidence is *composed* along the chain, so the final answer carries honest, compounding uncertainty. | [`uncertainty.py`](src/prism/uncertainty.py) |
 | 5 | **Causal tracing** | Every output ships with a serializable record of *why* — beliefs, the speculate/commit decision, branch scores, winner rationale. | [`trace.py`](src/prism/trace.py) |
 
+## v0.2 — industrial hardening (all opt-in, all on-thesis)
+
+| Feature | The idea | Where |
+|---------|----------|-------|
+| **Latency hedging** | Borrowed idea #2, from "The Tail at Scale": if the committed arm blows through its learned p9x latency fence, launch the runner-up and race them. Speculation on the *time* axis — the second branch materialises only when the first stalls, and the straggler's late result still teaches the bandit. p99 collapses ~10× in the demo. | [`hedging.py`](src/prism/hedging.py) |
+| **Drift adaptation** | A Page–Hinkley change-point detector per arm. On alarm: **uncertainty resurrection** — the belief's evidence is collapsed, the posterior widens, P(best) flattens, and *speculation reignites automatically* to resolve the new ranking. Recovery after a silent model degradation: ~119 tasks → ~7 in the demo. | [`drift.py`](src/prism/drift.py) |
+| **Failure resilience** | Branch exceptions/timeouts become scored failures (reward 0 — the bandit learns from outages too); a stage where every branch fails triggers automatic failover to untried arms; a per-arm **circuit breaker** (closed → open → half-open probe, exponential backoff) quarantines repeat offenders at zero cost. | [`resilience.py`](src/prism/resilience.py), [`errors.py`](src/prism/errors.py) |
+| **Compute budgets** | Speculation degrades gracefully under budget pressure: full width → narrower → greedy-only → clean `BudgetExhausted` with the partial trace attached. A reserve fraction keeps future stages alive rather than letting early stages feast. | [`budget.py`](src/prism/budget.py) |
+| **Policy persistence** | Everything the system has *learned* (router beliefs, graph edge beliefs, breaker state) serializes to one JSON document and reloads across restarts — tolerating roster drift by loading the intersection. | `save_policy` / `load_policy` in [`orchestrator.py`](src/prism/orchestrator.py) |
+| **Bounded memory** | `max_evidence` caps each belief's pseudo-count (exponential forgetting): the policy stays permanently adaptable instead of calcifying after 10k observations. | [`routing.py`](src/prism/routing.py) |
+
+Every operational event — breaker trips, failovers, fired hedges, drift alarms,
+budget pressure — lands in the run's `CausalTrace.events`, so the provenance
+story extends to *incidents*, not just decisions.
+
 ---
 
 ## Install & run (zero API keys, zero network)
@@ -79,6 +94,11 @@ python examples/02_speculation_in_action.py
 python examples/03_bandit_convergence.py
 python examples/04_uncertainty_propagation.py
 python examples/05_causal_trace.py
+
+# and the industrial-hardening demos (v0.2):
+python examples/06_failure_resilience.py    # outage → failover → breaker → recovery
+python examples/07_drift_adaptation.py      # regime change → uncertainty resurrection
+python examples/08_latency_hedging.py       # tail collapse, measured wall-clock
 ```
 
 A 15-line pipeline:
@@ -287,6 +307,14 @@ about where the idea has edges:
 - **Rollback of external side effects** is cooperative: squashed branches with
   real-world effects (writes, emails, tool calls) must register a compensating
   action via `on_squash`. PRISM can't undo what it can't see.
+- **Timeouts abandon threads, they don't kill them.** Python threads can't be
+  cancelled; a timed-out branch is marked failed and its worker occupies a pool
+  slot until it finishes on its own. Size `max_workers` with headroom; use
+  async cancellation in latency-critical deployments.
+- **Drift detection has knobs.** Page–Hinkley's `delta`/`threshold` trade false
+  alarms against detection lag; the shipped defaults catch a 0.2+ quality drop
+  within ~10–20 observations of the degraded arm being *chosen* (an unchosen
+  arm produces no rewards to detect on — quarantined arms drift silently).
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the deep dive and
 [`docs/DESIGN_NOTES.md`](docs/DESIGN_NOTES.md) for the reasoning behind each
@@ -300,17 +328,23 @@ design choice and the alternatives considered.
 src/prism/
   uncertainty.py   Beta beliefs, moment-matched composition, P(best), entropy
   types.py         Task, AgentOutput, BranchOutcome, RouteMode
-  agents.py        Agent/Scorer protocols, SimulatedAgent, CallableAgent
-  routing.py       BanditRouter — Thompson sampling + online Beta updates
+  agents.py        Agent/Scorer protocols, SimulatedAgent, CallableAgent, FlakyAgent
+  routing.py       BanditRouter — Thompson sampling, evidence cap, drift hook, persistence
   scoring.py       calibrated (empirical-Bayes) winner selection
-  speculation.py   SpeculationPolicy (VOI economics) + SpeculativeExecutor
-  graph.py         TaskGraph — weighted, conditional, probabilistic
-  orchestrator.py  the conductor that ties it all together
-  trace.py         CausalTrace — human + JSON provenance
+  speculation.py   SpeculationPolicy (VOI economics, budget-aware) + SpeculativeExecutor
+                   (parallel branches, timeouts, failure semantics, hedged races)
+  hedging.py       LatencyTracker (windowed-quantile fences) + HedgePolicy
+  drift.py         PageHinkley + DriftMonitor — uncertainty resurrection
+  resilience.py    CircuitBreaker (closed/open/half-open, exponential backoff)
+  budget.py        ComputeBudget — graceful degradation under cost pressure
+  errors.py        PrismError hierarchy (failures carry their partial trace)
+  graph.py         TaskGraph — weighted, conditional, probabilistic, persistable
+  orchestrator.py  the conductor: routing, speculation, hedging, failover, budgets
+  trace.py         CausalTrace — human + JSON provenance, operational events
   scenarios.py     the shared "research assistant" demo pipeline
   cli.py           `prism demo | learn | benchmark`
-examples/          one runnable, annotated script per pillar
-tests/             pytest suite
+examples/          one runnable, annotated script per mechanism (01–08)
+tests/             pytest suite (core + industrial edge cases)
 docs/              architecture + design notes
 ```
 

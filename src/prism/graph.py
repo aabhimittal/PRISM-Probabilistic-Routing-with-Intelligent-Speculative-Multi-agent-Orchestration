@@ -110,6 +110,29 @@ class TaskGraph:
                 e.belief = e.belief.updated(reward)
                 return
 
+    # --- persistence --------------------------------------------------------
+
+    def state_dict(self) -> list[dict]:
+        """The learned edge beliefs as JSON-able rows. Predicates and weights
+        are code/config, not learned state — they are not serialized."""
+        return [
+            {"src": e.src, "dst": e.dst,
+             "alpha": e.belief.alpha, "beta": e.belief.beta}
+            for edges in self._edges.values() for e in edges
+        ]
+
+    def load_state_dict(self, rows: list[dict]) -> int:
+        """Restore edge beliefs saved by :meth:`state_dict`; unknown edges are
+        skipped (roster drift tolerated). Returns edges restored."""
+        loaded = 0
+        for row in rows:
+            for e in self._edges.get(row["src"], []):
+                if e.dst == row["dst"]:
+                    e.belief = Belief(float(row["alpha"]), float(row["beta"]))
+                    loaded += 1
+                    break
+        return loaded
+
     @staticmethod
     def linear(*task_types: str) -> "TaskGraph":
         """Convenience: build a straight-line pipeline stage0 -> stage1 -> ...

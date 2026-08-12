@@ -78,3 +78,6 @@ class BranchOutcome:
     posterior_mean: float     # belief mean *after* incorporating the score
     is_winner: bool = False
     squashed: bool = False    # True for speculative losers (CPU: branch squash)
+    failed: bool = False      # raised or timed out — excluded from selection,
+                              # but still fed to the bandit as a zero reward
+    error: str = ""           # repr of the exception / "timeout" when failed

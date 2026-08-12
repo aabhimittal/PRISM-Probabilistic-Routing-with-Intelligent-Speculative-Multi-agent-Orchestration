@@ -104,7 +104,13 @@ constructor that wires router + policy + executor + scorer from an
 ### `trace.py` — provenance
 `CausalTrace` / `StageTrace` / `RoutingRationale` capture everything. `explain()`
 renders the annotated decision tree you paste into a PR; `to_json()` serializes
-it for storage, diffing, or handing to an auditing agent.
+it for storage, diffing, or handing to an auditing agent. `CausalTrace.events`
+carries the operational log: breaker trips, failovers, hedges, drift alarms.
+
+### `resilience.py`, `drift.py`, `hedging.py`, `budget.py`, `errors.py` — the industrial layer
+Circuit breaking, change-point detection with uncertainty resurrection,
+tail-latency hedging, compute budgets, and the exception hierarchy. Covered in
+detail in "The industrial layer" below.
 
 ## Control flow (one stage, precise)
 
@@ -138,6 +144,61 @@ is the entire point: speculation buys quality without a latency penalty
 proportional to width. Determinism is preserved because scoring/selection happens
 after the barrier, in a fixed order.
 
+## The industrial layer (v0.2)
+
+Each of these is opt-in via `Orchestrator.build(...)`; leaving them off yields
+the simple, deterministic v0.1 behaviour.
+
+### Failure path, precisely
+
+```
+branch raises/times out ──► BranchOutcome(failed=True, score=0)  ─┐
+                            (winner chosen among survivors)       │ reward-0
+ALL branches fail ────────► AllBranchesFailed ─► failover over    ├─ updates +
+                            untried arms (one round)              │ breaker
+failover fails too ───────► StageFailure(.trace = partial trace)  ┘ records
+```
+
+Failures are evidence: every failed call is a reward-0 bandit update *and* a
+`CircuitBreaker.record()`. The breaker's state machine per (stage, agent):
+CLOSED → (N consecutive failures) → OPEN for `cooldown` runs → HALF-OPEN probe
+→ success closes / failure re-opens with doubled cooldown (capped). A roster
+that is entirely OPEN is overridden — degraded routing beats refusing to route.
+
+### Hedged execution path
+
+`run_stage_hedged` (executor) is used when the policy commits a single arm and
+a `HedgePolicy` is armed: run primary → `wait(hedge_after)` → if still pending,
+launch backup → commit **first successful** result → straggler's completion
+fires `on_late`, which scores it and updates the bandit from a worker thread
+(router updates are lock-serialized). The fence comes from `LatencyTracker`, a
+sliding-window empirical quantile per (stage, agent) — see design notes §7.1
+for why it is *not* mean + kσ.
+
+### Drift path
+
+`BanditRouter.update()` → `DriftMonitor.observe()` → Page–Hinkley per arm → on
+alarm, the arm's belief is *replaced* with a wide Beta anchored on the
+detector's recent-window mean (uncertainty resurrection). The orchestrator
+drains `DriftMonitor` events into `CausalTrace.events` each stage. `max_evidence`
+(exponential forgetting via rescaling α, β before each update) complements it:
+the cap keeps the policy movable at all; the detector makes big shifts fast.
+
+### Budget path
+
+`Orchestrator.run(budget=...)` gates each stage on `can_afford_base(cheapest)`
+(raising `BudgetExhausted` with the partial trace when even greedy work is
+unaffordable) and passes the budget into `SpeculationPolicy.decide`, which
+narrows or suppresses the branch set when `can_afford_extra` fails — recording
+the pressure in the decision's explanation. Stage costs are spent after
+execution; `reserve_fraction` shields headroom for later stages.
+
+### Persistence
+
+`Orchestrator.save_policy(path)` → one JSON document: router `state_dict`
+(α, β per arm), graph edge beliefs, breaker state, run counter.
+`load_policy` restores the intersection with the current roster.
+
 ## Extension points
 
 | You want to... | Do this |
@@ -148,3 +209,8 @@ after the barrier, in a fixed order.
 | Seed domain knowledge | Pass `priors` to `Orchestrator.build` |
 | Branch on content | Add conditional edges with predicates in `TaskGraph` |
 | Undo side effects of squashed branches | Pass `on_squash` to the executor |
+| Survive flaky agents | `breaker=CircuitBreaker(...)`, `timeout=...` in `build` |
+| Collapse the latency tail | `hedge=HedgePolicy(...)` in `build` |
+| Track non-stationary agents | `drift=DriftMonitor(...)`, `max_evidence=...` in `build` |
+| Cap spend | `orch.run(..., budget=ComputeBudget(total=...))` |
+| Keep learning across restarts | `orch.save_policy(p)` / `orch.load_policy(p)` |
