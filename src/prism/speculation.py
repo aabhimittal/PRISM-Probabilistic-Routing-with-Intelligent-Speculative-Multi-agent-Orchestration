@@ -29,14 +29,19 @@ Two things make this more than a gimmick:
 from __future__ import annotations
 
 import random
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from .agents import Agent, Scorer
+from .errors import AllBranchesFailed
 from .scoring import calibrate, select_winner
 from .types import AgentOutput, BranchOutcome, RouteMode, Task
 from .uncertainty import Belief, probability_best, selection_entropy
+
+if TYPE_CHECKING:
+    from .budget import ComputeBudget
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +108,8 @@ class SpeculationPolicy:
         return best
 
     def decide(self, beliefs: dict[str, Belief], costs: dict[str, float],
-               stakes: float) -> SpeculationDecision:
+               stakes: float,
+               budget: "Optional[ComputeBudget]" = None) -> SpeculationDecision:
         names = list(beliefs)
         greedy = max(names, key=lambda n: beliefs[n].mean)  # VOI reference arm
 
@@ -144,13 +150,37 @@ class SpeculationPolicy:
         extra_cost = (spec_cost - base_cost) * self.cost_weight
 
         speculate = len(branches) > 1 and value > extra_cost
+
+        # --- budget governor -----------------------------------------------
+        # Speculation may only spend *extra* compute the budget can spare.
+        # Degrade in order: full width → narrower → greedy. This is the
+        # graceful-degradation ladder, and every rung is recorded.
+        budget_note = ""
+        if speculate and budget is not None:
+            def _raw_extra() -> float:
+                return sum(costs.get(b, 1.0) for b in branches) - base_cost
+
+            while len(branches) > 2 and not budget.can_afford_extra(_raw_extra()):
+                # Drop the least-likely branch that isn't the greedy anchor.
+                for i in range(len(branches) - 1, -1, -1):
+                    if branches[i] != greedy:
+                        del branches[i]
+                        break
+            if not budget.can_afford_extra(_raw_extra()):
+                speculate = False
+                budget_note = (f" [budget: speculation suppressed — "
+                               f"remaining={budget.remaining:.1f}]")
+            elif len(branches) < self.max_branches:
+                budget_note = f" [budget: narrowed to {len(branches)} branches]"
+            spec_cost = sum(costs.get(b, 1.0) for b in branches)
+
         if speculate:
             mode = RouteMode.SPECULATIVE
             expl = (
                 f"speculating over {len(branches)} branches: "
                 f"value_of_info={value:.3f} > extra_cost={extra_cost:.3f} "
                 f"(greedy P(best)={p_best[greedy]:.2f}, regret if committed="
-                f"{r_greedy:.3f}, stakes={stakes:.2f})"
+                f"{r_greedy:.3f}, stakes={stakes:.2f})" + budget_note
             )
         else:
             mode = RouteMode.GREEDY
@@ -163,6 +193,7 @@ class SpeculationPolicy:
                 f"single-arm route → {committed!r}{explore_note}: "
                 f"value_of_info={value:.3f} ≤ extra_cost={extra_cost:.3f} "
                 f"— not worth the compute (greedy P(best)={p_best[greedy]:.2f})"
+                + budget_note
             )
 
         return SpeculationDecision(
@@ -199,6 +230,8 @@ class StageResult:
     outcomes: list[BranchOutcome]
     latency: float           # wall-clock = slowest branch (they run in parallel)
     cost: float              # compute = sum over branches
+    hedged: bool = False     # True when a latency hedge actually fired
+    note: str = ""           # short annotation for the trace (hedge/failure info)
 
 
 class SpeculativeExecutor:
@@ -209,12 +242,72 @@ class SpeculativeExecutor:
     output. If your agents have *external* side effects (writes, emails, tool
     calls), register a compensating action via ``on_squash`` and PRISM will
     invoke it for every squashed branch, mirroring a CPU discarding a
-    mis-speculated store buffer.
+    mis-speculated store buffer. (Failed branches do NOT trigger ``on_squash`` —
+    there is no committed output to compensate; agents are expected to be
+    internally transactional on failure.)
+
+    Industrial failure semantics
+    ----------------------------
+    * A branch that **raises** becomes a failed outcome (score 0, ``failed=True``)
+      rather than crashing the stage — the winner is chosen among survivors.
+    * With ``timeout`` set, branches still pending at the deadline are marked
+      failed with ``error='timeout'``. Python threads cannot be killed, so the
+      worker is *abandoned*, not cancelled: it may complete later and its slot
+      in the pool is occupied until then. Size ``max_workers`` with headroom,
+      and prefer async cancellation in latency-critical deployments (disclosed
+      limitation, not hidden).
+    * A **scorer** exception downgrades to the agent's ``self_report`` rather
+      than failing the branch — a broken judge shouldn't erase real work, but
+      an unjudged score is weak evidence, and calibration treats it as such.
+    * If every branch fails, :class:`~prism.errors.AllBranchesFailed` is raised
+      with the outcomes attached; the orchestrator uses it to fail over.
+
+    The worker pool is persistent (created lazily) so that hedged/abandoned
+    calls can outlive a single ``run_stage`` invocation; call :meth:`close`
+    on shutdown if you care about prompt thread teardown.
     """
 
-    def __init__(self, scorer: Scorer, max_workers: int = 8) -> None:
+    def __init__(self, scorer: Scorer, max_workers: int = 8,
+                 timeout: float | None = None) -> None:
         self.scorer = scorer
         self.max_workers = max_workers
+        self.timeout = timeout
+        self._pool: ThreadPoolExecutor | None = None
+
+    # --- pool management ----------------------------------------------------
+
+    def _ensure_pool(self) -> ThreadPoolExecutor:
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(max_workers=self.max_workers,
+                                            thread_name_prefix="prism")
+        return self._pool
+
+    def close(self) -> None:
+        if self._pool is not None:
+            self._pool.shutdown(wait=False, cancel_futures=True)
+            self._pool = None
+
+    @staticmethod
+    def _call_agent(agent: Agent, task: Task) -> AgentOutput:
+        """Run the agent and make sure the output carries a real latency (a
+        wall-clock measurement fills in when the agent doesn't report one) —
+        the latency tracker that powers hedging feeds on this."""
+        t0 = time.perf_counter()
+        out = agent.run(task)
+        if out.latency <= 0.0:
+            out.latency = time.perf_counter() - t0
+        return out
+
+    def _score(self, task: Task, out: AgentOutput) -> tuple[float, str]:
+        """Score an output, downgrading to self_report if the scorer itself
+        blows up. Returns (score, note)."""
+        try:
+            return self.scorer.score(task, out), ""
+        except Exception as exc:  # noqa: BLE001 — judge failure must not kill the stage
+            fallback = min(max(out.self_report, 0.0), 1.0)
+            return fallback, f"scorer error ({exc!r}); fell back to self_report"
+
+    # --- the main mechanism -------------------------------------------------
 
     def run_stage(
         self,
@@ -225,50 +318,208 @@ class SpeculativeExecutor:
     ) -> StageResult:
         # 1. Fan out: execute every branch agent in parallel. In real use these
         #    are I/O-bound LLM calls, so threads give true wall-clock overlap.
-        outputs: dict[str, AgentOutput] = {}
-        if len(branch_agents) == 1:
-            a = branch_agents[0]
-            outputs[a.name] = a.run(task)
-        else:
-            with ThreadPoolExecutor(max_workers=min(self.max_workers, len(branch_agents))) as ex:
-                futures = {ex.submit(a.run, task): a.name for a in branch_agents}
-                for fut in futures:
-                    outputs[futures[fut]] = fut.result()
+        pool = self._ensure_pool()
+        futures = {pool.submit(self._call_agent, a, task): a for a in branch_agents}
+        done, pending = wait(list(futures), timeout=self.timeout)
 
-        # 2. Score + calibrate each branch against its prior (empirical Bayes).
+        outputs: dict[str, AgentOutput] = {}
+        failures: dict[str, str] = {}
+        for fut in done:
+            a = futures[fut]
+            exc = fut.exception()
+            if exc is not None:
+                failures[a.name] = repr(exc)
+            else:
+                outputs[a.name] = fut.result()
+        for fut in pending:
+            a = futures[fut]
+            failures[a.name] = "timeout"   # thread abandoned, slot occupied
+
+        if not outputs:
+            all_failed = [
+                BranchOutcome(
+                    agent_name=a.name,
+                    output=AgentOutput(output=None, self_report=0.0,
+                                       cost=a.cost,
+                                       latency=self.timeout or 0.0),
+                    score=0.0, prior_mean=priors[a.name].mean,
+                    posterior_mean=priors[a.name].mean,
+                    failed=True, error=failures[a.name],
+                )
+                for a in branch_agents
+            ]
+            raise AllBranchesFailed(task.task_type, all_failed)
+
+        # 2. Score + calibrate each SURVIVING branch against its prior.
         scored = []
         raw_scores: dict[str, float] = {}
+        notes: list[str] = []
         for a in branch_agents:
+            if a.name not in outputs:
+                continue
             out = outputs[a.name]
-            raw = self.scorer.score(task, out)
+            raw, note = self._score(task, out)
+            if note:
+                notes.append(f"{a.name}: {note}")
             raw_scores[a.name] = raw
             scored.append(calibrate(a.name, raw, priors[a.name],
                                     getattr(self.scorer, "reliability", 0.85)))
 
-        # 3. Commit the calibrated winner; squash the losers.
+        # 3. Commit the calibrated winner; squash surviving losers; record
+        #    failures as zero-score outcomes (the bandit will learn from them).
         best = select_winner(scored)
         outcomes: list[BranchOutcome] = []
         latency = 0.0
         cost = 0.0
         for a in branch_agents:
-            out = outputs[a.name]
-            latency = max(latency, out.latency)
-            cost += out.cost
-            is_win = a.name == best.agent_name
-            cs = next(s for s in scored if s.agent_name == a.name)
-            outcome = BranchOutcome(
-                agent_name=a.name,
-                output=out,
-                score=raw_scores[a.name],
-                prior_mean=cs.prior_mean,
-                posterior_mean=cs.posterior_mean,
-                is_winner=is_win,
-                squashed=not is_win and len(branch_agents) > 1,
-            )
+            cost += a.cost   # a failed/timed-out call still cost you the call
+            if a.name in outputs:
+                out = outputs[a.name]
+                latency = max(latency, out.latency)
+                is_win = a.name == best.agent_name
+                cs = next(s for s in scored if s.agent_name == a.name)
+                outcome = BranchOutcome(
+                    agent_name=a.name, output=out, score=raw_scores[a.name],
+                    prior_mean=cs.prior_mean, posterior_mean=cs.posterior_mean,
+                    is_winner=is_win,
+                    squashed=not is_win and len(branch_agents) > 1,
+                )
+            else:
+                latency = max(latency, self.timeout or 0.0)
+                outcome = BranchOutcome(
+                    agent_name=a.name,
+                    output=AgentOutput(output=None, self_report=0.0,
+                                       cost=a.cost, latency=self.timeout or 0.0),
+                    score=0.0, prior_mean=priors[a.name].mean,
+                    posterior_mean=priors[a.name].mean,
+                    failed=True, error=failures[a.name],
+                )
             outcomes.append(outcome)
             if outcome.squashed and on_squash is not None:
-                on_squash(a, out)  # compensate external side effects
+                on_squash(a, outcome.output)  # compensate external side effects
 
         winner = next(o for o in outcomes if o.is_winner)
+        if failures:
+            notes.append(f"failed branches: {sorted(failures)}")
         return StageResult(winner=winner, outcomes=outcomes,
-                           latency=latency, cost=cost)
+                           latency=latency, cost=cost, note="; ".join(notes))
+
+    # --- latency hedging (see prism.hedging) --------------------------------
+
+    def run_stage_hedged(
+        self,
+        task: Task,
+        primary: Agent,
+        backup: Agent,
+        priors: dict[str, Belief],
+        hedge_after: float,
+        on_late=None,
+    ) -> StageResult:
+        """Single-arm execution with a latency hedge armed.
+
+        Runs ``primary``; if it hasn't completed within ``hedge_after`` seconds,
+        launches ``backup`` and commits the **first successful** result. The
+        straggler is abandoned but not wasted: when it eventually completes,
+        ``on_late(agent_name, output_or_none, error_or_none)`` fires (from the
+        worker thread) so its score can still update the bandit — the same
+        "squashed work still teaches" principle, applied to time.
+        """
+        pool = self._ensure_pool()
+        t0 = time.perf_counter()
+        f_primary = pool.submit(self._call_agent, primary, task)
+        done, _ = wait([f_primary], timeout=hedge_after)
+
+        if done:
+            exc = f_primary.exception()
+            if exc is None:
+                return self._single_result(task, primary, f_primary.result(),
+                                           priors, t0, hedged=False)
+            # Primary failed fast — run the backup as a plain failover.
+            f_backup = pool.submit(self._call_agent, backup, task)
+            done_b, _ = wait([f_backup], timeout=self.timeout)
+            b_exc = f_backup.exception() if done_b else None
+            if not done_b or b_exc is not None:
+                raise AllBranchesFailed(task.task_type, [
+                    self._failed_outcome(primary, repr(exc), priors),
+                    self._failed_outcome(backup,
+                                         repr(b_exc) if b_exc else "timeout",
+                                         priors),
+                ])
+            res = self._single_result(task, backup, f_backup.result(),
+                                      priors, t0, hedged=False)
+            res.cost += primary.cost
+            res.note = f"primary {primary.name!r} failed fast ({exc!r}); failover to backup"
+            return res
+
+        # Primary is in its latency tail: fire the hedge.
+        f_backup = pool.submit(self._call_agent, backup, task)
+        futures = {f_primary: primary, f_backup: backup}
+        remaining = dict(futures)
+        deadline = t0 + self.timeout if self.timeout else None
+
+        taken_agent: Agent | None = None
+        taken_out: AgentOutput | None = None
+        while remaining:
+            budget_left = None if deadline is None else max(deadline - time.perf_counter(), 0.0)
+            done2, _ = wait(list(remaining), timeout=budget_left,
+                            return_when=FIRST_COMPLETED)
+            if not done2:
+                break  # overall timeout: everything still pending is abandoned
+            for fut in done2:
+                agent = remaining.pop(fut)
+                if fut.exception() is None and taken_agent is None:
+                    taken_agent, taken_out = agent, fut.result()
+            if taken_agent is not None:
+                break
+
+        if taken_agent is None:
+            raise AllBranchesFailed(task.task_type, [
+                self._failed_outcome(a, "failed or timed out in hedged race",
+                                     priors)
+                for a in (primary, backup)
+            ])
+
+        # Wire the straggler's eventual completion back into the learning loop.
+        for fut, agent in remaining.items():
+            def _late(f, name=agent.name):
+                if on_late is None:
+                    return
+                exc = f.exception()
+                on_late(name, None if exc else f.result(),
+                        repr(exc) if exc else None)
+            fut.add_done_callback(_late)
+
+        res = self._single_result(task, taken_agent, taken_out, priors, t0,
+                                  hedged=True)
+        res.cost = primary.cost + backup.cost   # the hedge was launched: both paid
+        res.note = (f"latency hedge fired at {hedge_after * 1000:.0f}ms — "
+                    f"committed {taken_agent.name!r} "
+                    f"({'backup' if taken_agent is backup else 'primary'} won the race)")
+        return res
+
+    def _failed_outcome(self, agent: Agent, error: str,
+                        priors: dict[str, Belief]) -> BranchOutcome:
+        prior = priors.get(agent.name)
+        mean = prior.mean if prior is not None else 0.5
+        return BranchOutcome(
+            agent_name=agent.name,
+            output=AgentOutput(output=None, self_report=0.0, cost=agent.cost,
+                               latency=self.timeout or 0.0),
+            score=0.0, prior_mean=mean, posterior_mean=mean,
+            failed=True, error=error,
+        )
+
+    def _single_result(self, task: Task, agent: Agent, out: AgentOutput,
+                       priors: dict[str, Belief], t0: float,
+                       hedged: bool) -> StageResult:
+        raw, note = self._score(task, out)
+        cs = calibrate(agent.name, raw, priors[agent.name],
+                       getattr(self.scorer, "reliability", 0.85))
+        outcome = BranchOutcome(
+            agent_name=agent.name, output=out, score=raw,
+            prior_mean=cs.prior_mean, posterior_mean=cs.posterior_mean,
+            is_winner=True,
+        )
+        return StageResult(winner=outcome, outcomes=[outcome],
+                           latency=time.perf_counter() - t0, cost=agent.cost,
+                           hedged=hedged, note=note)

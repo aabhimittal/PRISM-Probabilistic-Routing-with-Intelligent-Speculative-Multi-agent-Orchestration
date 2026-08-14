@@ -73,6 +73,10 @@ class CausalTrace:
     total_cost: float = 0.0
     total_latency: float = 0.0
     speculations: int = 0
+    # Notable operational events during this run: drift alarms, circuit-breaker
+    # transitions, failovers, fired latency hedges, budget pressure. Part of the
+    # provenance — an incident review starts here.
+    events: list[str] = field(default_factory=list)
 
     @property
     def mean_realized_quality(self) -> float:
@@ -123,6 +127,11 @@ class CausalTrace:
                 f"  │    p_best={_fmt_probs(r.p_best)}  H={r.selection_entropy:.2f} nats"
             )
             for oc in st.outcomes:
+                if oc.failed:
+                    lines.append(
+                        f"  │      • {oc.agent_name:<14} ✗ FAILED ({oc.error})"
+                    )
+                    continue
                 mark = "★ winner" if oc.is_winner else " squashed" if oc.squashed else ""
                 lines.append(
                     f"  │      • {oc.agent_name:<14} score={oc.score:.3f} "
@@ -132,6 +141,10 @@ class CausalTrace:
                 f"  │    propagated confidence → mean={st.propagated_belief.mean:.3f} "
                 f"± {st.propagated_belief.std:.3f}"
             )
+        if self.events:
+            lines.append("  ├─ events:")
+            for ev in self.events:
+                lines.append(f"  │      ⚠ {ev}")
         lines.append(f"  └─ output: {_truncate(self.final_output)}")
         return "\n".join(lines)
 

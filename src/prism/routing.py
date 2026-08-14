@@ -18,10 +18,15 @@ adaptation the project promises: routing is never static.
 from __future__ import annotations
 
 import random
+import threading
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Optional
 
 from .agents import Agent
 from .uncertainty import Belief, probability_best, selection_entropy
+
+if TYPE_CHECKING:
+    from .drift import DriftMonitor
 
 
 @dataclass
@@ -32,14 +37,36 @@ class BanditRouter:
     and sharpens as the system runs. Because beliefs are immutable
     :class:`Belief` values, snapshotting them into a causal trace is free and
     safe.
+
+    Industrial extensions (all opt-in, default off):
+
+    ``max_evidence``
+        Caps the pseudo-count of evidence per arm by rescaling ``(α, β)`` before
+        each update (mean preserved, memory bounded). A bandit with unbounded
+        evidence becomes immovable — after 10,000 observations, no realistic
+        stream of bad rewards can shift it in useful time. Capping evidence is
+        exponential forgetting: the policy stays permanently adaptable, at the
+        price of slightly wider steady-state uncertainty. Values of 100–500 are
+        sensible; None disables.
+    ``drift``
+        A :class:`~prism.drift.DriftMonitor`. Every reward is also fed to a
+        per-arm change-point detector; on an alarm the arm's belief is
+        soft-reset (uncertainty resurrection) so routing re-adapts in tens of
+        tasks instead of hundreds.
+    Updates are serialized by an internal lock, making concurrent
+    ``Orchestrator.run`` calls from multiple threads safe (though runs are then
+    no longer bit-for-bit deterministic — order of interleaving is OS-scheduled).
     """
 
     rng: random.Random = field(default_factory=lambda: random.Random(0))
     prior: Belief = Belief(1.0, 1.0)
+    max_evidence: Optional[float] = None
+    drift: Optional["DriftMonitor"] = None
     # task_type -> agent_name -> Agent
     _arms: dict[str, dict[str, Agent]] = field(default_factory=dict)
     # task_type -> agent_name -> Belief
     _beliefs: dict[str, dict[str, Belief]] = field(default_factory=dict)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     # --- registration -------------------------------------------------------
 
@@ -94,18 +121,61 @@ class BanditRouter:
         ``(before, after)`` so the caller can record the exact delta in the
         trace. Called for *every* branch that runs — winners and squashed
         losers alike — which is what makes speculation double as free
-        exploration."""
-        before = self._beliefs[task_type][agent_name]
-        after = before.updated(reward, weight=weight)
-        self._beliefs[task_type][agent_name] = after
-        return before, after
+        exploration.
+
+        With ``max_evidence`` set, the belief is first rescaled to the cap
+        (exponential forgetting); with ``drift`` set, the reward also feeds the
+        change-point detector, which may replace the posterior wholesale
+        (uncertainty resurrection)."""
+        with self._lock:
+            before = self._beliefs[task_type][agent_name]
+            base = before
+            if self.max_evidence is not None and base.evidence > self.max_evidence:
+                scale = self.max_evidence / base.evidence
+                base = Belief(alpha=max(base.alpha * scale, 1e-3),
+                              beta=max(base.beta * scale, 1e-3))
+            after = base.updated(reward, weight=weight)
+            if self.drift is not None:
+                replacement = self.drift.observe(task_type, agent_name, reward, after)
+                if replacement is not None:
+                    after = replacement
+            self._beliefs[task_type][agent_name] = after
+            return before, after
 
     # --- introspection ------------------------------------------------------
 
     def snapshot(self) -> dict[str, dict[str, tuple[float, float]]]:
         """Dump the whole learned policy as plain numbers (mean, std) for
         logging / plotting convergence."""
-        return {
-            tt: {n: (b.mean, b.std) for n, b in arms.items()}
-            for tt, arms in self._beliefs.items()
-        }
+        with self._lock:
+            return {
+                tt: {n: (b.mean, b.std) for n, b in arms.items()}
+                for tt, arms in self._beliefs.items()
+            }
+
+    # --- persistence --------------------------------------------------------
+
+    def state_dict(self) -> dict[str, dict[str, list[float]]]:
+        """The learned policy as plain JSON-able numbers: ``{stage: {agent:
+        [alpha, beta]}}``. This *is* everything the router has learned."""
+        with self._lock:
+            return {
+                tt: {n: [b.alpha, b.beta] for n, b in arms.items()}
+                for tt, arms in self._beliefs.items()
+            }
+
+    def load_state_dict(self, data: dict[str, dict[str, list[float]]]) -> int:
+        """Restore beliefs from :meth:`state_dict` output. Only (stage, agent)
+        pairs that are currently registered are restored — a saved policy from
+        an older roster loads its intersection rather than exploding. Returns
+        the number of beliefs restored."""
+        loaded = 0
+        with self._lock:
+            for tt, arms in data.items():
+                if tt not in self._beliefs:
+                    continue
+                for name, ab in arms.items():
+                    if name in self._beliefs[tt]:
+                        self._beliefs[tt][name] = Belief(float(ab[0]), float(ab[1]))
+                        loaded += 1
+        return loaded

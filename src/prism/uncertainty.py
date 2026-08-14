@@ -103,7 +103,15 @@ class Belief:
         A perfect output (reward=1) adds a full unit to alpha; a total failure
         adds it to beta; a 0.7 adds 0.7 / 0.3. ``weight`` lets a *confident*
         score move the posterior more than a hedged one.
+
+        Industrial hardening: non-finite rewards (NaN/inf from a broken scorer)
+        are treated as total failures (0.0) rather than poisoning the posterior;
+        negative weights are ignored. Garbage in must never corrupt the policy.
         """
+        if not math.isfinite(reward):
+            reward = 0.0
+        if not math.isfinite(weight) or weight < 0.0:
+            weight = 0.0
         reward = _clamp(reward, 0.0, 1.0)
         return Belief(
             alpha=self.alpha + weight * reward,

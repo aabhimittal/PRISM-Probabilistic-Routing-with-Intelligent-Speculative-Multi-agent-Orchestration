@@ -140,7 +140,97 @@ a cost-conscious operator actually thinks in.
 
 ---
 
-## 7. Things deliberately left out (scope discipline)
+## 7. v0.2 — the industrial features, and why they're shaped this way
+
+### 7.1 Latency hedging: why a *quantile* fence, not mean + kσ
+
+The first implementation used the obvious estimator — EMA of latency plus three
+EW standard deviations. It never fired. The failure is instructive: production
+agent latency is **bimodal** (a fast mode plus a fat tail), and the tail
+inflates both the mean and σ, hoisting the fence *above* the very stragglers it
+exists to catch. The estimator self-defeats on exactly the distribution it's
+for. The fix is what the hedged-request literature actually specifies: an
+empirical **quantile** over a sliding window — exact, O(window) memory,
+drift-adapting by construction. We kept the discovery in the docstring because
+"mean + kσ intuition fails on bimodal data" is a lesson worth the space.
+
+### 7.2 Why hedging is a separate mechanism from speculation
+
+They look similar (both run extra branches) but answer different questions.
+Speculation answers *"who will produce the better output?"* — it must launch
+branches **up front**, because its value comes from comparing finished outputs.
+Hedging answers *"will my chosen arm answer in time?"* — it must launch
+**lazily**, because its value comes from *not* paying the duplicate cost on the
+92% of calls that stay fast. Same family (spend compute to buy down
+uncertainty), different uncertainty, different launch schedule. Folding them
+into one mechanism would force one schedule and ruin one of the two economics.
+
+### 7.3 Drift: why *reset* beliefs instead of decaying them
+
+Exponential forgetting (`max_evidence`) is included and helps, but on its own
+it's a compromise: decay fast enough to track drift and you're permanently
+noisy; slow enough to be stable and you're slow to react. A change-point
+detector breaks the trade-off — keep long, stable memory *until there is
+specific evidence of a regime change*, then discard it wholesale. The reset is
+also the on-thesis move: it re-creates the cold-start condition, and PRISM's
+cold-start machinery (Thompson exploration + speculation) reignites
+automatically. Detection and recovery are decoupled — Page–Hinkley only pulls a
+trigger; the existing uncertainty machinery does all the actual adapting.
+
+Two subtleties found while building it:
+
+* **Anchor the reset on the *recent* mean, not the stream mean.** Page–Hinkley
+  tracks the running mean of the whole stream, which at alarm time is dominated
+  by the dead regime — anchoring there resets the belief optimistically high.
+  The detector now keeps a 10-observation window; its mean is the only honest
+  estimate of the *new* regime.
+* **A quarantined arm drifts silently.** Detection needs rewards; rewards need
+  the arm to be chosen. This is a real blind spot shared by every
+  passive-observation scheme, and it interacts with the circuit breaker (which
+  deliberately stops choosing an arm). Disclosed rather than papered over.
+
+### 7.4 Failure semantics: failures are *evidence*, not just errors
+
+Every failure path funnels into the same principle: an exception or timeout
+becomes a **reward-0 belief update** — an outage is the strongest possible
+evidence about an agent's current usefulness, and throwing it away would waste
+exactly the signal that routing needs. The ladder (absorb failed branch →
+failover across untried arms → `StageFailure` with the partial trace attached)
+exists because each rung is cheaper than the next; most incidents should
+resolve on the first rung, invisibly. The circuit breaker sits on top because a
+bandit alone keeps *probing* a hard-down agent (Thompson still samples it
+occasionally) — the breaker makes "stop calling it entirely, then probe on a
+schedule" explicit, with exponential backoff because flapping services punish
+naive fixed cooldowns.
+
+One interaction surfaced by the demo and worth stating: with the breaker
+holding an arm out, that arm's *call count* freezes — so failure windows
+expressed in calls never end. Outages are wall-clock phenomena; `FlakyAgent`
+grew a `clock` hook for exactly this reason, and real deployments should think
+in the same terms.
+
+### 7.5 Budgets: a governor, not a veto
+
+The budget doesn't just refuse speculation — it degrades it in a controlled
+ladder (full width → narrower → greedy-only → clean `BudgetExhausted`), and
+every rung is recorded in the decision's explanation. The `reserve_fraction`
+encodes the operational instinct "don't let early stages feast and starve the
+pipeline": speculative *extra* compute may only spend the unreserved slice,
+while baseline greedy work may dip into the reserve, because finishing
+cheaply beats speculating early and not finishing at all.
+
+### 7.6 Persistence: state is what's learned, nothing else
+
+`save_policy` serializes belief tables, edge beliefs, and breaker state — and
+deliberately *not* agents, scorers, or policy knobs. Those are code and config;
+persisting them invites version skew between the saved object and the running
+system. Loading tolerates roster drift (intersection semantics) because in
+production the roster *will* change between save and load, and refusing to
+load anything because one agent was renamed is the wrong failure mode.
+
+---
+
+## 8. Things deliberately left out (scope discipline)
 
 - **A real LLM backend in the core.** Kept out so the repo runs with zero keys
   and the *ideas* stay the star. Adapters are a ~10-line `CallableAgent`.
@@ -154,7 +244,7 @@ a cost-conscious operator actually thinks in.
 
 ---
 
-## 8. If you're going to poke holes
+## 9. If you're going to poke holes
 
 Good — here's where to aim, honestly:
 
